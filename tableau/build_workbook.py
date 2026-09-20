@@ -2,38 +2,34 @@
 """
 build_workbook.py
 
-Builds the Overview page of the Channel Ledger dashboard for Tableau, styled to
-match dashboard_mockup/channel_ledger.html:
+Builds the Channel Ledger dashboard for Tableau, styled after dashboard_mockup/channel_ledger.html:
 
-    channel_performance.hyper   Tableau extract made from cleaned_data/channel_performance.csv
+    channel_performance.hyper   Tableau extract of cleaned_data/channel_performance.csv
     marketing_dashboard.twbx    packaged workbook (workbook XML + the extract)
 
-    Overview = masthead, Period / Channel controls, page title with a live scope label,
-               6 KPI tiles with sparklines, Revenue & Spend line, ROAS line, Revenue by Channel
+Pages (each is two dashboards, "<page>" and "<page> - Tables", switched by a Charts | Tables toggle):
+    Overview            KPI tiles with sparklines, revenue & spend, ROAS and revenue-by-channel charts
+    Channel efficiency  ROAS by channel, share gap, channel scorecard, channel x quarter ROAS heatmap
 
-Tableau Public only opens extracts (not live Excel/CSV connections), hence the .hyper.
+Tableau Public only opens extracts, hence the .hyper.
 
-How the controls work: Period and Channel are dashboard parameters, and every measure is written as
-SUM(IF [In scope] THEN ... END), so the whole dashboard follows them. Worksheet filters were tried first
-and Tableau rejected every form written from this script, hence parameters.
+Period and Channel are dashboard parameters, and every measure is written as SUM(IF [In scope] THEN ... END)
+so the whole dashboard follows them (Tableau rejected every worksheet filter written from this script).
+Buttons point at their target dashboard by id, so every sheet, dashboard and window gets a simple-id and the
+file declares the newer format features in document-format-change-manifest.
 
-Charts | Tables: two dashboards ("Overview" and "Overview - Tables") with the same header and tiles.
-A pair of navigation buttons in the filter bar switches between them; Period and Channel carry across.
-The file declares Tableau's newer format features (document-format-change-manifest) and gives every
-sheet, dashboard and window an id, because buttons point at their target by id.
-
-Known limits (Tableau, not the data): Channel is single-select; Tableau shows "N nulls" badges on charts
-when a period leaves months empty (right-click the badge > Hide Indicator); the ROAS axis cannot be given
-an "x" suffix from the file; hover dimming and styled tooltips are not available; in Tableau's editor a
-navigation button needs Alt+click (in presentation mode / on the web a normal click works).
+Known limits: Channel is single-select; "N nulls" badges appear when a period leaves months empty (right-click >
+Hide Indicator); axis labels can't take an "x" suffix; hover dimming and styled tooltips aren't available;
+custom colour ramps written into the file are ignored (the heatmap uses Tableau's built-in Blue); in the editor a
+navigation button needs Alt+click (presentation mode and the web take a normal click).
 
 Requires:  pip install tableauhyperapi pandas
-Run:       python tableau/build_workbook.py            (dark theme, as in the mockup)
-           python tableau/build_workbook.py light      (light theme)
+Run:       python tableau/build_workbook.py [light]      (dark theme by default, as in the mockup)
 Then open marketing_dashboard.twbx in Tableau Desktop or Tableau Public.
 """
 
 import os
+import re
 import sys
 import uuid
 import xml.etree.ElementTree as ET
@@ -45,7 +41,7 @@ from tableauhyperapi import (Connection, CreateMode, Date, HyperProcess, Inserte
                              TableDefinition, TableName, Telemetry)
 
 def guid(key):
-    """Stable GUID for a sheet/window, in the {UPPER-CASE} form Tableau uses."""
+    """Stable GUID in Tableau's {UPPER-CASE} form."""
     return "{" + str(uuid.uuid5(uuid.NAMESPACE_URL, "channel-ledger/" + key)).upper() + "}"
 
 
@@ -77,8 +73,9 @@ CHANNEL_COLORS = list(zip(CHANNELS, T["ch"]))
 
 # Calculated fields. name -> (caption, formula)
 SCOPE = "[Calculation_5000000000000001]"   # boolean: row is inside the chosen Period and Channel
+_ROAS = f"SUM(IF {SCOPE} AND [spend_missing]=0 THEN [revenue] END) / SUM(IF {SCOPE} THEN [spend] END)"
 CALCS = {
-    "[Calculation_1000000000000001]": ("ROAS", f"SUM(IF {SCOPE} AND [spend_missing]=0 THEN [revenue] END) / SUM(IF {SCOPE} THEN [spend] END)"),
+    "[Calculation_1000000000000001]": ("ROAS", _ROAS),
     "[Calculation_1000000000000002]": ("AOV", f"SUM(IF {SCOPE} THEN [revenue] END) / SUM(IF {SCOPE} THEN [orders] END)"),
     "[Calculation_1000000000000003]": ("Conv Rate", f"SUM(IF {SCOPE} THEN [orders] END) / SUM(IF {SCOPE} THEN [sessions] END)"),
 }
@@ -123,13 +120,12 @@ for _nm, _cap, _col in ((REV, "Revenue", "revenue"), (SPEND, "Spend", "spend"),
                         (ORD, "Orders", "orders"), (SESS, "Sessions", "sessions")):
     CALCS[_nm] = (_cap, f"SUM(IF {SCOPE} THEN [{_col}] END)")
 
-# sparkline series: each month minus its average over the scope, so the line always straddles zero and
-# Tableau's automatic axis fills the height in every period and channel
+# sparkline series: each month minus the scope average, so Tableau's automatic axis always fills the height
 _S = SCOPE
-_E = {  # per-month expression, and whether it is additive (per-month average) or a ratio (scope-wide ratio)
+_E = {  # per-month expression, and whether it is additive (else a ratio)
     "Revenue": (f"SUM(IF {_S} THEN [revenue] END)", True),
     "Spend": (f"SUM(IF {_S} THEN [spend] END)", True),
-    "ROAS": (f"SUM(IF {_S} AND [spend_missing]=0 THEN [revenue] END) / SUM(IF {_S} THEN [spend] END)", False),
+    "ROAS": (_ROAS, False),
     "Orders": (f"SUM(IF {_S} THEN [orders] END)", True),
     "AOV": (f"SUM(IF {_S} THEN [revenue] END) / SUM(IF {_S} THEN [orders] END)", False),
     "Conv Rate": (f"SUM(IF {_S} THEN [orders] END) / SUM(IF {_S} THEN [sessions] END)", False),
@@ -154,6 +150,42 @@ for _i, _ch in enumerate(CHANNELS):
     _nm = f"[Calculation_200000000000000{_i + 1}]"
     CALCS[_nm] = (_ch, f'SUM(IF {SCOPE} AND [channel]="{_ch}" THEN [revenue] END)')
     CH_CALC[_ch] = _nm
+
+# ---- Channel efficiency: one measure per channel, so each bar takes its channel colour
+ROAS_CH, GAP_CH = {}, {}
+for _i, _ch in enumerate(CHANNELS):
+    _r, _g = f"[Calculation_110000000000000{_i + 1}]", f"[Calculation_120000000000000{_i + 1}]"
+    CALCS[_r] = (f"{_ch} ROAS",
+                 f'SUM(IF {SCOPE} AND [channel]="{_ch}" AND [spend_missing]=0 THEN [revenue] END) / '
+                 f'SUM(IF {SCOPE} AND [channel]="{_ch}" THEN [spend] END)')
+    CALCS[_g] = (f"{_ch} share gap",
+                 f'SUM(IF {SCOPE} AND [channel]="{_ch}" THEN [revenue] END) / MIN({{FIXED : SUM(IF {SCOPE} THEN [revenue] END)}})'
+                 f' - SUM(IF {SCOPE} AND [channel]="{_ch}" THEN [spend] END) / MIN({{FIXED : SUM(IF {SCOPE} THEN [spend] END)}})')
+    ROAS_CH[_ch], GAP_CH[_ch] = _r, _g
+
+# generic measures: they split by whatever dimension is on the sheet
+COST, BOUNCE, RPS, SHARE_GAP, QLBL = (f"[Calculation_13000000000000{i:02d}]" for i in range(1, 6))
+CALCS[COST] = ("Cost per order", f"SUM(IF {SCOPE} AND [spend_missing]=0 THEN [spend] END) / "
+                                 f"SUM(IF {SCOPE} AND [spend_missing]=0 THEN [orders] END)")
+CALCS[BOUNCE] = ("Bounce rate", f"SUM(IF {SCOPE} THEN [bounced_sessions] END) / SUM(IF {SCOPE} THEN [sessions] END)")
+CALCS[RPS] = ("Rev / session", f"SUM(IF {SCOPE} THEN [revenue] END) / SUM(IF {SCOPE} THEN [sessions] END)")
+CALCS[SHARE_GAP] = ("Share gap",
+                    f"SUM(IF {SCOPE} THEN [revenue] END) / MIN({{FIXED : SUM(IF {SCOPE} THEN [revenue] END)}})"
+                    f" - SUM(IF {SCOPE} THEN [spend] END) / MIN({{FIXED : SUM(IF {SCOPE} THEN [spend] END)}})")
+VS_AVG = "[Calculation_1300000000000006]"
+CALCS[VS_AVG] = ("vs avg", f"({_ROAS}) - MIN({{FIXED : {_ROAS}}})")
+CALCS[QLBL] = ("Quarter", 'LEFT([month],4) + " Q" + STR(INT((INT(RIGHT([month],2)) - 1) / 3) + 1)')
+CALC_META[QLBL] = ("string", "dimension", "nominal")
+
+
+def mn_channel_maps():
+    """Measure Names colour rules: every per-channel measure takes that channel's colour."""
+    out = []
+    for grp in (CH_CALC, ROAS_CH, GAP_CH):
+        for nm, hx in CHANNEL_COLORS:
+            out.append(f"        <map to='{hx}'><bucket>{Q}[{DS}].[usr:{grp[nm].strip('[]')}:qk]{Q}</bucket></map>")
+    return "\n".join(out)
+
 
 # Extract columns: (name, datatype, role, type, remote-type)
 COLUMNS = [
@@ -217,7 +249,7 @@ def datasource_xml():
         for n, dt, role, ty, _ in COLUMNS
     )
     maps = "\n".join(f"        <map to='{hx}'><bucket>{Q}{nm}{Q}</bucket></map>" for nm, hx in CHANNEL_COLORS)
-    # colour follows the entity: assign the channel palette under every field spelling Tableau might key on
+    # the channel palette, under every field spelling Tableau might key on
     channel_enc = "".join(
         f"      <encoding attr='color' field='{fld}' type='palette'>\n{maps}\n      </encoding>\n"
         for fld in ("[none:channel:nk]", "[channel]", f"[{DS}].[none:channel:nk]")
@@ -243,7 +275,7 @@ def datasource_xml():
 {channel_enc}      <encoding attr='color' field='[:Measure Names]' type='palette'>
         <map to='{T["ink"]}'><bucket>{Q}[{DS}].[usr:{REV[1:-1]}:qk]{Q}</bucket></map>
         <map to='{T["slate"]}'><bucket>{Q}[{DS}].[usr:{SPEND[1:-1]}:qk]{Q}</bucket></map>
-{chr(10).join(f"        <map to='{hx}'><bucket>{Q}[{DS}].[usr:{CH_CALC[nm].strip('[]')}:qk]{Q}</bucket></map>" for nm, hx in CHANNEL_COLORS)}
+{mn_channel_maps()}
       </encoding>
     </style-rule>
   </style>
@@ -298,7 +330,7 @@ def fmt_rule(element, *formats):
 
 
 def line_rules(grid_color, zero_color, visible=True):
-    """Gridline + zeroline rules under every attribute spelling Tableau might honour."""
+    """Gridline + zeroline rules, under every attribute spelling Tableau might honour."""
     scopes = ("rows", "cols")
     g, z = [], []
     for col, out in ((grid_color, g), (zero_color, z)):
@@ -314,8 +346,8 @@ def line_rules(grid_color, zero_color, visible=True):
     return fmt_rule("gridline", *g) + fmt_rule("zeroline", *z)
 
 
-def sheet_style(kind, text_x=None, textfmt=None, size=None, axis_fields=(), axis_formats=(), fixed_range=None,
-                num_formats=(), palette=None, color_x=None, bg_color=None):
+def sheet_style(kind, text_x=None, textfmt=None, size=None, axis_fields=(), axis_formats=(),
+                num_formats=(), bg_color=None, axis_color=None, cell_width=None):
     """Worksheet-level <style>: dark/light surface, hairline grid, mono axis labels."""
     bg = bg_color or T["surface"]
     r = [
@@ -324,9 +356,8 @@ def sheet_style(kind, text_x=None, textfmt=None, size=None, axis_fields=(), axis
         fmt_rule("table", ("background-color", bg), ("border-style", "none")),
         fmt_rule("pane", ("background-color", bg), ("border-style", "none")),
     ]
-    if kind in ("kpi", "meta", "button"):
-        fam, col, align = {"kpi": (SANS_SB, T["ink"], "left"), "meta": (MONO, T["muted"], "right"),
-                           "button": (SANS_SB, T["ink2"], "center")}[kind]
+    if kind in ("kpi", "meta"):
+        fam, col, align = {"kpi": (SANS_SB, T["ink"], "left"), "meta": (MONO, T["muted"], "right")}[kind]
         parts = ([("text-format", textfmt, {"field": text_x})] if textfmt else []) + [
             ("font-family", fam), ("font-size", str(size)), ("color", col), ("text-align", align),
             ("background-color", bg)] + ([("width", "560")] if kind == "meta" else [])
@@ -335,14 +366,9 @@ def sheet_style(kind, text_x=None, textfmt=None, size=None, axis_fields=(), axis
         hide = "".join(
             f"<format attr='display' class='0' field='{fld}' scope='{sc}' value='false' />" for fld, sc in axis_fields
         )
-        space = ""
-        if fixed_range:
-            fld, (lo, hi) = fixed_range
-            space = (f"<encoding attr='space' class='0' field='{fld}' field-type='quantitative' include-zero='false' "
-                     f"range-type='auto' scope='rows' type='space' />")
         r += [
             f"<style-rule element='axis'>{hide}<format attr='color' value='{bg}' /><format attr='tick-color' value='{bg}' />"
-            f"<format attr='line-visibility' value='off' /><format attr='stroke-color' value='{bg}' />{space}</style-rule>",
+            f"<format attr='line-visibility' value='off' /><format attr='stroke-color' value='{bg}' /></style-rule>",
             fmt_rule("header", ("color", bg), ("background-color", bg)),
             line_rules(bg, bg, visible=False),
         ]
@@ -354,33 +380,27 @@ def sheet_style(kind, text_x=None, textfmt=None, size=None, axis_fields=(), axis
             f"<format attr='text-format' class='0' field='{fld}' scope='{sc}' value='{nf}' />"
             for fld, sc, nf in axis_formats
         )
-        also = "".join(
-            f"<format attr='text-format' class='0' field='{fld}' scope='{sc}' value='{nf}' />"
-            for fld, sc, nf in axis_formats
-        )
         r += [
             f"<style-rule element='header'><format attr='font-family' value='{MONO}' /><format attr='font-size' value='8' />"
-            f"<format attr='color' value='{T['muted']}' /><format attr='background-color' value='{bg}' />{also}</style-rule>",
-            f"<style-rule element='cell'>{also}</style-rule>",
+            f"<format attr='color' value='{T['muted']}' /><format attr='background-color' value='{bg}' />{fmts}</style-rule>",
+            f"<style-rule element='cell'>{fmts}</style-rule>",
             f"<style-rule element='axis'><format attr='font-family' value='{MONO}' /><format attr='font-size' value='8' />"
-            f"<format attr='color' value='{T['muted']}' /><format attr='tick-color' value='{T['axis']}' />"
+            f"<format attr='color' value='{axis_color or T['muted']}' /><format attr='tick-color' value='{T['axis']}' />"
             f"<format attr='stroke-color' value='{T['axis']}' />{fmts}{titles}</style-rule>",
             line_rules(T["grid"], T["axis"]),
         ]
-        if num_formats:
-            r.append("<style-rule element='cell'>" + "".join(
+        width = f"<format attr='width' value='{cell_width}' />" if cell_width else ""
+        if num_formats or width:
+            r.append("<style-rule element='cell'>" + width + "".join(
                 f"<format attr='text-format' field='{fld}' value='{nf}' />" for fld, nf in num_formats) + "</style-rule>")
-        if palette and color_x:
-            maps = "".join(f"<map to='{hx}'><bucket>{Q}{nm}{Q}</bucket></map>" for nm, hx in palette)
-            r.append(f"<style-rule element='mark'><encoding attr='color' field='{color_x}' type='palette'>"
-                     f"{maps}</encoding></style-rule>")
     return "<style>" + "".join(r) + "</style>"
 
 
 def worksheet(name, cols=None, rows=None, mark="Automatic", text=None, color=None, textfmt=None,
               measure_values=None, kind="chart", size=22, mark_color=None, label_last=False,
-              stroke=False, palette=None, bar_size=None, stack_top_down=None,
-              bg_color=None):
+              stroke=False, bar_size=None, stack_top_down=None,
+              bg_color=None, horizontal=False, label_all=False, mv_format=None, hide_value_axis=False,
+              cell_width=None):
     """cols/rows: list of (column, kind). text/color: (column, kind). measure_values: list of (column, kind)."""
     deps, insts = {}, {}
 
@@ -412,12 +432,18 @@ def worksheet(name, cols=None, rows=None, mark="Automatic", text=None, color=Non
             f"{order}<slices><column>[{DS}].[:Measure Names]</column></slices>"
         )
         deps[":mn"] = "<column datatype='string' name='[:Measure Names]' role='dimension' type='nominal' />"
-        rows_x = [f"[{DS}].[Multiple Values]"]
+        if horizontal:
+            rows_x = [f"[{DS}].[:Measure Names]"]
+            cols_x = [f"[{DS}].[Multiple Values]"]
+        else:
+            rows_x = [f"[{DS}].[Multiple Values]"]
         color_x = f"[{DS}].[:Measure Names]"
 
     axis_fields = [(x, "cols") for x in cols_x] + [(x, "rows") for x in rows_x]
     axis_formats = []
     for cx in cols_x:
+        if "Multiple Values" in cx:
+            continue
         base = cx.split("].[", 1)[1].rstrip("]")               # tmn:month_start:qk
         for spelling in (cx, f"[{base}]", f"[{DS}].[month_start]", "[month_start]"):
             axis_formats.append((spelling, "cols", "*mmm yy"))
@@ -428,13 +454,16 @@ def worksheet(name, cols=None, rows=None, mark="Automatic", text=None, color=Non
             for spelling in (rx, f"[{base}]"):
                 axis_formats.append((spelling, "rows", fmt('n0"x"')))
             num_formats.append((rx, fmt('n0.00"x"')))
-        elif "Multiple Values" not in rx:
+        elif "Multiple Values" not in rx and ":Measure Names" not in rx:
             num_formats.append((rx, fmt('c"$"#,##0')))
-    num_formats += [(m, fmt('c"$"#,##0')) for m in mv]
+    if text_x and textfmt and kind == "chart":
+        num_formats.append((text_x, textfmt))
+    mv_calcs = [c for c, _k in (measure_values or [])]
+    num_formats += [(m, mv_format(c) if mv_format else fmt('c"$"#,##0')) for m, c in zip(mv, mv_calcs)]
     style = sheet_style(kind, text_x=text_x, textfmt=textfmt, size=size, num_formats=num_formats,
-                        axis_fields=axis_fields, axis_formats=axis_formats, palette=palette, color_x=color_x,
-                        fixed_range=None,
-                        bg_color=bg_color)
+                        axis_fields=axis_fields, axis_formats=axis_formats,
+                        bg_color=bg_color, axis_color=T["surface"] if hide_value_axis else None,
+                        cell_width=cell_width)
 
     mark_fmt = ""
     if mark_color:
@@ -446,6 +475,8 @@ def worksheet(name, cols=None, rows=None, mark="Automatic", text=None, color=Non
     if label_last:
         mark_fmt += ("<format attr='mark-labels-show' value='true' /><format attr='mark-labels-cull' value='false' />"
                      "<format attr='mark-labels-mode' value='most-recent' />")
+    if label_all:
+        mark_fmt += "<format attr='mark-labels-show' value='true' /><format attr='mark-labels-cull' value='false' />"
     pane_style = f"<style><style-rule element='mark'>{mark_fmt}</style-rule></style>" if mark_fmt else ""
     sizing = "<mark-sizing mark-sizing-setting='marks-scaling-off' />" if bar_size else ""
 
@@ -482,19 +513,36 @@ def worksheet(name, cols=None, rows=None, mark="Automatic", text=None, color=Non
 </worksheet>"""
 
 
-def table_sheet(name, measures):
-    """Text table for the Tables view: one row per month, one column per measure."""
+def measure_format(calc):
+    """Number format for a measure, used in tables and labels."""
+    if calc in (ROAS,) or calc in ROAS_CH.values():
+        return fmt('n0.00"x"')
+    if calc == VS_AVG:
+        return fmt('n"▲ "0.00"x";"▼ "0.00"x"')
+    if calc in (CVR, BOUNCE, SHARE_GAP) or calc in GAP_CH.values():
+        return fmt("p0.0%")
+    if calc == RPS:
+        return fmt('c"$"#,##0.00')
+    return fmt('c"$"#,##0')
+
+
+def table_sheet(name, measures, rows=("[month]", "none"), row_order=None, cw=None):
+    """Text table: a row per member of `rows`, a column per measure."""
     mn = f"[{DS}].[:Measure Names]"
-    deps = dep_column("[month]") + "".join(dep_column(m) for m in measures)
-    insts = instance("[month]", "none")[1] + "".join(instance(m, "usr")[1] for m in measures)
+    row_field = field(instance(*rows)[0].strip("[]"))
+    deps = dep_column(rows[0]) + "".join(dep_column(m) for m in measures)
+    insts = instance(*rows)[1] + "".join(instance(m, "usr")[1] for m in measures)
     mv = [field(instance(m, "usr")[0].strip("[]")) for m in measures]
     members = "".join(f"<groupfilter function='member' level='[:Measure Names]' member='{Q}{x}{Q}' />" for x in mv)
     buckets = "".join(f"<bucket>{Q}{x}{Q}</bucket>" for x in mv)
+    row_sort = ""
+    if row_order:
+        rb = "".join(f"<bucket>{Q}{v}{Q}</bucket>" for v in row_order)
+        row_sort = f"<sort class='manual' column='{row_field}' direction='ASC'><dictionary>{rb}</dictionary></sort>"
     bg = T["surface"]
-    cw = 620 if len(measures) == 1 else 380 if len(measures) == 2 else 300   # roomy columns so tables fill their card
-    cell_fmts = "".join(
-        f"<format attr='text-format' field='{x}' value='{fmt('n0.00\"x\"') if m == ROAS else fmt('c\"$\"#,##0')}' />"
-        for x, m in zip(mv, measures))
+    cw = cw or (620 if len(measures) == 1 else 380 if len(measures) == 2 else 300)   # roomy columns fill the card
+    cell_fmts = "".join(f"<format attr='text-format' field='{x}' value='{measure_format(m)}' />"
+                        for x, m in zip(mv, measures))
     style = ("<style>"
              + fmt_rule("worksheet", ("background-color", bg), ("font-family", SANS), ("font-size", "9"),
                         ("color", T["muted"]))
@@ -515,6 +563,7 @@ def table_sheet(name, measures):
       {PARAM_DEP}
       <filter class='categorical' column='{mn}'><groupfilter function='union' user:op='manual'>{members}</groupfilter></filter>
       <sort class='manual' column='{mn}' direction='ASC'><dictionary>{buckets}</dictionary></sort>
+      {row_sort}
       <slices><column>{mn}</column></slices>
       <aggregation value='true' />
     </view>
@@ -526,8 +575,56 @@ def table_sheet(name, measures):
         <encodings><text column='[{DS}].[Multiple Values]' /></encodings>
       </pane>
     </panes>
-    <rows>{field('none:month:nk')}</rows>
+    <rows>{row_field}</rows>
     <cols>{mn}</cols>
+  </table>
+  <simple-id uuid='{guid("sheet/" + name)}' />
+</worksheet>"""
+
+
+def heat_sheet(name, row_dim, col_dim, row_order, cw):
+    """Heatmap of ROAS by two dimensions, coloured with Tableau's built-in Blue ramp."""
+    row_field = field(instance(row_dim, "none")[0].strip("[]"))
+    col_field = field(instance(col_dim, "none")[0].strip("[]"))
+    roas_field = field(instance(ROAS, "usr")[0].strip("[]"))
+    deps = "".join(dep_column(c) for c in (row_dim, col_dim, ROAS))
+    insts = "".join(instance(c, k)[1] for c, k in ((row_dim, "none"), (col_dim, "none"), (ROAS, "usr")))
+    rb = "".join(f"<bucket>{Q}{v}{Q}</bucket>" for v in row_order)
+    bg = T["surface"]
+    rev = "true" if THEME == "dark" else "false"      # dark: low = dark, high = light
+    style = ("<style>"
+             + fmt_rule("worksheet", ("background-color", bg), ("font-family", SANS), ("font-size", "9"),
+                        ("color", T["muted"]))
+             + fmt_rule("table", ("background-color", bg), ("border-style", "none"))
+             + fmt_rule("pane", ("background-color", bg), ("border-style", "none"))
+             + fmt_rule("header", ("font-family", MONO), ("font-size", "9"), ("color", T["muted"]),
+                        ("background-color", bg))
+             + f"<style-rule element='cell'><format attr='font-family' value='{MONO}' /><format attr='font-size' value='10' />"
+               f"<format attr='color' value='{T['ink']}' /><format attr='width' value='{cw}' />"
+               f"<format attr='text-format' field='{roas_field}' value='{measure_format(ROAS)}' /></style-rule>"
+             + f"<style-rule element='mark'><encoding attr='color' field='{roas_field}' palette='blue_10_0' "
+               f"min='0' max='10' reverse='{rev}' type='interpolated' /></style-rule>"
+             + line_rules(T["grid"], T["axis"]) + "</style>")
+    return f"""<worksheet name='{name}'>
+  <table>
+    <view>
+      <datasources><datasource caption='channel_performance' name='{DS}' />{PARAM_REF}</datasources>
+      <datasource-dependencies datasource='{DS}'>{deps}{insts}</datasource-dependencies>
+      {PARAM_DEP}
+      <sort class='manual' column='{row_field}' direction='ASC'><dictionary>{rb}</dictionary></sort>
+      <aggregation value='true' />
+    </view>
+    {style}
+    <panes>
+      <pane selection-relaxation-option='selection-relaxation-allow'>
+        <view><breakdown value='auto' /></view>
+        <mark class='Square' />
+        <encodings><text column='{roas_field}' /><color column='{roas_field}' /></encodings>
+        <style><style-rule element='mark'><format attr='mark-labels-show' value='true' /><format attr='mark-labels-cull' value='false' /></style-rule></style>
+      </pane>
+    </panes>
+    <rows>{row_field}</rows>
+    <cols>{col_field}</cols>
   </table>
   <simple-id uuid='{guid("sheet/" + name)}' />
 </worksheet>"""
@@ -565,8 +662,32 @@ TABLES = {
 for _n, _m in TABLES.items():
     sheets.append(table_sheet(_n, _m))
 
-# ---------------------------------------------------------------- dashboard layout (1400 x 900, absolute 0-100000 units)
-DASH_W, DASH_H = 1400, 900
+# ---- Channel efficiency sheets (row/bar order is the all-time order)
+ROAS_ORDER = ["Organic", "Email", "Google Ads", "Meta", "Affiliate"]      # best ROAS first
+GAP_ORDER = ["Email", "Organic", "Google Ads", "Affiliate", "Meta"]        # biggest positive gap first
+REV_ORDER = ["Google Ads", "Meta", "Email", "Organic", "Affiliate"]        # biggest revenue first
+_top_down = lambda order, tbl: [(tbl[c], "usr") for c in order]
+sheets.append(worksheet("ROAS by Channel", mark="Bar", horizontal=True, bar_size="2.5", label_all=True,
+                        hide_value_axis=True,
+                        mv_format=measure_format,
+                        measure_values=_top_down(ROAS_ORDER, ROAS_CH), stack_top_down=_top_down(ROAS_ORDER, ROAS_CH)))
+sheets.append(worksheet("Share Gap by Channel", mark="Bar", horizontal=True, bar_size="2.5", label_all=True,
+                        hide_value_axis=True,
+                        mv_format=measure_format,
+                        measure_values=_top_down(GAP_ORDER, GAP_CH), stack_top_down=_top_down(GAP_ORDER, GAP_CH)))
+# ROAS by quarter as a heatmap: channels x quarters, blue scale, value in each cell
+sheets.append(heat_sheet("ROAS Heatmap", "[channel]", QLBL, REV_ORDER, 190))
+SCORE_COLS = [SPEND, REV, ROAS, VS_AVG, COST, AOV, CVR, BOUNCE, RPS]
+sheets.append(table_sheet("Channel scorecard", SCORE_COLS, rows=("[channel]", "none"), row_order=REV_ORDER, cw=175))
+EFF_TABLES = {
+    "ROAS by channel table": dict(measures=[ROAS], rows=("[channel]", "none"), row_order=ROAS_ORDER),
+    "Share gap table": dict(measures=[SHARE_GAP], rows=("[channel]", "none"), row_order=GAP_ORDER),
+    "ROAS by quarter table": dict(measures=[ROAS_CH[c] for c in REV_ORDER], rows=(QLBL, "none"), cw=300),
+}
+for _n, _kw in EFF_TABLES.items():
+    sheets.append(table_sheet(_n, **_kw))
+
+# ---------------------------------------------------------------- dashboard layout (absolute 0-100000 units)
 zid = [10]
 
 
@@ -619,7 +740,7 @@ def container(param, x, y, w, h, inner, bg=None, border=None, margin=0, padding=
 
 
 def card(x, y, w, h, title, subtitle, sheet_name, legend_runs=None):
-    """Mockup card: surface panel, hairline border, title + muted subtitle, legend top-right, chart below."""
+    """Surface panel with title, subtitle, optional legend top-right, and the sheet below."""
     head_h = int(h * 0.20)
     left_w = int(w * (0.66 if legend_runs else 1.0))
     head = text_zone(run(title, 11, T["ink"], True, SANS_SB) + NL + run(subtitle, 9, T["muted"]),
@@ -641,7 +762,12 @@ def kpi_tile(i, x, y, w, h, label, sheet):
 
 
 H_BRAND, H_FILT, H_HEAD, H_KPI, H_MID, H_BOT = 5000, 5000, 6000, 21000, 31500, 31500
-DASH_CHARTS, DASH_TABLES = "Overview", "Overview - Tables"
+PAGES = ["Overview", "Channel efficiency"]
+QUESTION = {"Overview": "How are we doing?", "Channel efficiency": "Where should the money go?"}
+
+
+def dname(page, tables=False):
+    return f"{page} - Tables" if tables else page
 
 
 def param_zone(param, x, w, y):
@@ -650,75 +776,65 @@ def param_zone(param, x, w, y):
 
 
 def window_id(dash_name):
-    """Stable GUID Tableau uses to identify a dashboard window (buttons point at it)."""
+    """GUID of a dashboard window (what buttons point at)."""
     return guid("window/" + dash_name)
 
 
-def view_toggle(tables, y):
-    """Charts | Tables switch: the current view is a static pill, the other is a navigation button."""
-    def pill(label, x):
-        return text_zone(run(label, 10, T["surface"], True, SANS_SB, align=1), x, y, 8000, H_FILT,
-                         bg=T["ink"], padding=14, margin=8)
-
-    def button(label, target, x):
-        return (f"<zone h='{H_FILT}' id='{nid()}' type-v2='dashboard-object' w='8000' x='{x}' y='{y}'>"
-                f"<button action='tabdoc:goto-sheet window-id=&quot;{window_id(target)}&quot;' button-type='text'>"
-                f"<button-visual-state><caption>{label}</caption>"
-                f"<button-caption-font-style fontcolor='{T['ink2']}' fontname='{SANS_SB}' fontsize='10' />"
-                f"<format attr='background-color' value='{T['hair']}' /></button-visual-state></button>"
-                f"{zstyle(None, margin=8)}</zone>")
-    if tables:
-        return button("Charts", DASH_CHARTS, 84000) + pill("Tables", 92000)
-    return pill("Charts", 84000) + button("Tables", DASH_TABLES, 92000)
+def nav_pill(label, x, w, y, h, fixed=None):
+    """The current page or view: a lit, non-clickable pill."""
+    return text_zone(run(label, 10, T["surface"], True, SANS_SB, align=1), x, y, w, h,
+                     bg=T["ink"], padding=14, margin=8, fixed=fixed)
 
 
-def build_dashboard(dash_name, tables):
-    """The Overview dashboard; tables=True swaps each chart for its data table."""
-    y = 0
+def nav_button(label, target, x, w, y, h, fixed=None):
+    """Navigation button to another dashboard."""
+    return (f"<zone{fixed_attr(fixed)} h='{h}' id='{nid()}' type-v2='dashboard-object' w='{w}' x='{x}' y='{y}'>"
+            f"<button action='tabdoc:goto-sheet window-id=&quot;{window_id(target)}&quot;' button-type='text'>"
+            f"<button-visual-state><caption>{label}</caption>"
+            f"<button-caption-font-style fontcolor='{T['ink2']}' fontname='{SANS_SB}' fontsize='10' />"
+            f"<format attr='background-color' value='{T['hair']}' /></button-visual-state></button>"
+            f"{zstyle(None, margin=8)}</zone>")
+
+
+def masthead(page, y):
+    """Brand on the left, one button per page on the right."""
     brand = text_zone(
         run("Channel Ledger", 13, T["ink"], True, SANS_SB) + run("     channel_performance.hyper", 8, T["muted"], font=MONO),
-        0, y, 100000, H_BRAND, bg=T["surface"], padding=12, fixed=46)
-    y += H_BRAND
-    filter_bar = container(
+        0, y, 62000, H_BRAND, bg=T["surface"], padding=12)
+    btns, x, bw = "", 62000, 19000
+    for pg in PAGES:
+        btns += (nav_pill(pg, x, bw, y, H_BRAND, fixed=190) if pg == page
+                 else nav_button(pg, dname(pg), x, bw, y, H_BRAND, fixed=190))
+        x += bw
+    return container("horz", 0, y, 100000, H_BRAND, brand + btns, bg=T["surface"], fixed=46)
+
+
+def view_toggle(page, tables, y):
+    """Charts | Tables switch: the current view is a pill, the other a button."""
+    if tables:
+        return (nav_button("Charts", dname(page), 84000, 8000, y, H_FILT, fixed=120)
+                + nav_pill("Tables", 92000, 8000, y, H_FILT, fixed=120))
+    return (nav_pill("Charts", 84000, 8000, y, H_FILT, fixed=120)
+            + nav_button("Tables", dname(page, True), 92000, 8000, y, H_FILT, fixed=120))
+
+
+def filter_bar(page, tables, y):
+    return container(
         "horz", 0, y, 100000, H_FILT,
         param_zone(P1, 0, 15000, y) + param_zone(P2, 15000, 15000, y)
         + text_zone(run(" ", 8, T["muted"]), 30000, y, 54000, H_FILT, bg=T["surface"])
-        + view_toggle(tables, y),
+        + view_toggle(page, tables, y),
         bg=T["surface"], fixed=58)
-    y += H_FILT
-    page_head = container("horz", 0, y, 100000, H_HEAD,
-                          text_zone(run("How are we doing?", 17, T["ink"], True, SANS_SB), 0, y, 60000, H_HEAD,
-                                    bg=T["page"], padding=8)
-                          + sheet_zone("Scope", 60000, y, 40000, H_HEAD, bg=T["page"]), bg=T["page"], fixed=48)
-    y += H_HEAD
-    hero_w = 26000
-    tile_w = (100000 - hero_w) // 5
-    tiles, x = "", 0
-    for i, (label, sheet, *_r) in enumerate(KPI):
-        w = hero_w if i == 0 else tile_w
-        tiles += kpi_tile(i, x, y, w, H_KPI, label, sheet)
-        x += w
-    kpi_row = container("horz", 0, y, 100000, H_KPI, tiles, bg=T["page"], margin=6, fixed=236)
-    y += H_KPI
-    leg_lines = (run("▬ ", 9, T["ink"], align=2) + run("Revenue     ", 9, T["ink2"], align=2)
-                 + run("▬ ", 9, T["slate"], align=2) + run("Spend", 9, T["ink2"], align=2))
-    leg_ch = "".join(run("■ ", 9, c, align=2) + run(nm + "    ", 9, T["ink2"], align=2) for nm, c in CHANNEL_COLORS)
-    s_rs, s_roas, s_ch = (("Revenue and Spend table", "ROAS table", "Revenue by Channel table") if tables else
-                          ("Revenue and Spend by Month", "ROAS by Month", "Revenue by Channel"))
-    mid_row = container("horz", 0, y, 100000, H_MID,
-                        card(0, y, 58000, H_MID, "Revenue and spend by month",
-                             "One dollar axis, so the gap between the lines is the margin over spend.",
-                             s_rs, None if tables else leg_lines)
-                        + card(58000, y, 42000, H_MID, "ROAS by month",
-                               "Revenue per dollar of spend, all selected channels.", s_roas),
-                        bg=T["page"])
-    y += H_MID
-    bot_row = container("horz", 0, y, 100000, H_BOT,
-                        card(0, y, 100000, H_BOT, "Revenue by channel",
-                             "Monthly revenue stacked by the channel on the order.", s_ch, None if tables else leg_ch),
-                        bg=T["page"])
-    stack = container("vert", 0, 0, 100000, 100000, brand + filter_bar + page_head + kpi_row + mid_row + bot_row,
-                      bg=T["page"])
+
+
+def page_head(page, y):
+    return container("horz", 0, y, 100000, H_HEAD,
+                     text_zone(run(QUESTION[page], 17, T["ink"], True, SANS_SB), 0, y, 60000, H_HEAD,
+                               bg=T["page"], padding=8)
+                     + sheet_zone("Scope", 60000, y, 40000, H_HEAD, bg=T["page"]), bg=T["page"], fixed=48)
+
+
+def dashboard_xml(dash_name, stack):
     return f"""<dashboard name='{dash_name}'>
   <style />
   <size sizing-mode='automatic' />
@@ -731,13 +847,89 @@ def build_dashboard(dash_name, tables):
 </dashboard>"""
 
 
-dash_charts = build_dashboard(DASH_CHARTS, tables=False)
-dash_tables = build_dashboard(DASH_TABLES, tables=True)
+LEG_CH = "".join(run("■ ", 9, c, align=2) + run(nm + "    ", 9, T["ink2"], align=2) for nm, c in CHANNEL_COLORS)
+LEG_LINES = (run("▬ ", 9, T["ink"], align=2) + run("Revenue     ", 9, T["ink2"], align=2)
+             + run("▬ ", 9, T["slate"], align=2) + run("Spend", 9, T["ink2"], align=2))
 
-common = [s for _l, s, *_r in KPI] + [s + " trend" for _l, s, *_r in KPI] + ["Scope"]
-names_charts = common + ["Revenue and Spend by Month", "ROAS by Month", "Revenue by Channel"]
-names_tables = common + list(TABLES)
-names = names_charts + list(TABLES)
+
+def build_overview(tables):
+    page, y = "Overview", 0
+    brand = masthead(page, y)
+    y += H_BRAND
+    fbar = filter_bar(page, tables, y)
+    y += H_FILT
+    head = page_head(page, y)
+    y += H_HEAD
+    hero_w = 26000
+    tile_w = (100000 - hero_w) // 5
+    tiles, x = "", 0
+    for i, (label, sheet, *_r) in enumerate(KPI):
+        w = hero_w if i == 0 else tile_w
+        tiles += kpi_tile(i, x, y, w, H_KPI, label, sheet)
+        x += w
+    kpi_row = container("horz", 0, y, 100000, H_KPI, tiles, bg=T["page"], margin=6, fixed=236)
+    y += H_KPI
+    s_rs, s_roas, s_ch = (("Revenue and Spend table", "ROAS table", "Revenue by Channel table") if tables else
+                          ("Revenue and Spend by Month", "ROAS by Month", "Revenue by Channel"))
+    mid_row = container("horz", 0, y, 100000, H_MID,
+                        card(0, y, 58000, H_MID, "Revenue and spend by month",
+                             "One dollar axis, so the gap between the lines is the margin over spend.",
+                             s_rs, None if tables else LEG_LINES)
+                        + card(58000, y, 42000, H_MID, "ROAS by month",
+                               "Revenue per dollar of spend, all selected channels.", s_roas),
+                        bg=T["page"])
+    y += H_MID
+    bot_row = container("horz", 0, y, 100000, H_BOT,
+                        card(0, y, 100000, H_BOT, "Revenue by channel",
+                             "Monthly revenue stacked by the channel on the order.", s_ch, None if tables else LEG_CH),
+                        bg=T["page"])
+    return dashboard_xml(dname(page, tables), container(
+        "vert", 0, 0, 100000, 100000, brand + fbar + head + kpi_row + mid_row + bot_row, bg=T["page"]))
+
+
+def build_efficiency(tables):
+    page, y = "Channel efficiency", 0
+    brand = masthead(page, y)
+    y += H_BRAND
+    fbar = filter_bar(page, tables, y)
+    y += H_FILT
+    head = page_head(page, y)
+    y += H_HEAD
+    hA, hB, hC = 32000, 24000, 28000
+    pick = (lambda chart, table: table if tables else chart)
+    row_a = container("horz", 0, y, 100000, hA,
+                      card(0, y, 50000, hA, "ROAS by channel",
+                           "Revenue per dollar of spend. Higher pays the budget back faster.",
+                           pick("ROAS by Channel", "ROAS by channel table"))
+                      + card(50000, y, 50000, hA, "Share of revenue minus share of spend",
+                             "Positive: the channel earns a bigger slice of revenue than it takes of the budget.",
+                             pick("Share Gap by Channel", "Share gap table")), bg=T["page"], fixed=236)
+    y += hA
+    row_b = container("horz", 0, y, 100000, hB,
+                      card(0, y, 100000, hB, "Channel scorecard", "Every efficiency measure side by side.",
+                           "Channel scorecard"), bg=T["page"], fixed=210)
+    y += hB
+    row_c = container("horz", 0, y, 100000, hC,
+                      card(0, y, 100000, hC, "ROAS by quarter",
+                           ("Lighter" if THEME == "dark" else "Darker") + " blue is better. Channel rankings barely move from quarter to quarter.",
+                           pick("ROAS Heatmap", "ROAS by quarter table")), bg=T["page"], fixed=252)
+    return dashboard_xml(dname(page, tables), container(
+        "vert", 0, 0, 100000, 100000, brand + fbar + head + row_a + row_b + row_c, bg=T["page"]))
+
+
+DASHBOARDS = [(dname(pg, tb), pg, tb) for pg in PAGES for tb in (False, True)]
+dashboards_xml = "\n".join((build_overview if pg == "Overview" else build_efficiency)(tb) for _n, pg, tb in DASHBOARDS)
+
+# sheets shown by each dashboard (its window's viewpoints)
+_common = [s for _l, s, *_r in KPI] + [s + " trend" for _l, s, *_r in KPI] + ["Scope"]
+DASH_SHEETS = {
+    dname("Overview"): _common + ["Revenue and Spend by Month", "ROAS by Month", "Revenue by Channel"],
+    dname("Overview", True): _common + list(TABLES),
+    dname("Channel efficiency"): ["Scope", "ROAS by Channel", "Share Gap by Channel", "Channel scorecard", "ROAS Heatmap"],
+    dname("Channel efficiency", True): ["Scope", "ROAS by channel table", "Share gap table", "Channel scorecard",
+                                        "ROAS by quarter table"],
+}
+names = re.findall(r"<worksheet name='([^']+)'>", "".join(sheets))
 win_sheets = "".join(
     f"<window class='worksheet' name='{n}'><cards>"
     "<edge name='left'><strip size='160'><card type='pages' /><card type='filters' /><card type='marks' /></strip></edge>"
@@ -751,11 +943,12 @@ def _vp(lst):
     return "".join(f"<viewpoint name='{n}' />" for n in lst)
 
 
-windows = (f"<windows source-height='30'>"
-           f"<window class='dashboard' maximized='true' name='{DASH_CHARTS}'><viewpoints>{_vp(names_charts)}</viewpoints>"
-           f"<active id='-1' /><simple-id uuid='{window_id(DASH_CHARTS)}' /></window>"
-           f"<window class='dashboard' name='{DASH_TABLES}'><viewpoints>{_vp(names_tables)}</viewpoints>"
-           f"<active id='-1' /><simple-id uuid='{window_id(DASH_TABLES)}' /></window>{win_sheets}</windows>")
+windows = ("<windows source-height='30'>"
+           + "".join(f"<window class='dashboard'{' maximized=' + chr(39) + 'true' + chr(39) if i == 0 else ''} name='{n}'>"
+                     f"<viewpoints>{_vp(DASH_SHEETS[n])}</viewpoints><active id='-1' />"
+                     f"<simple-id uuid='{window_id(n)}' /></window>"
+                     for i, (n, _pg, _tb) in enumerate(DASHBOARDS))
+           + win_sheets + "</windows>")
 
 doc = f"""<?xml version='1.0' encoding='utf-8' ?>
 <workbook original-version='18.1' source-build='2022.1.0 (20221.22.0324.1508)' source-platform='win' version='18.1' xmlns:user='http://www.tableausoftware.com/xml/user'>
@@ -778,8 +971,7 @@ doc = f"""<?xml version='1.0' encoding='utf-8' ?>
 {chr(10).join(sheets)}
   </worksheets>
   <dashboards>
-{dash_charts}
-{dash_tables}
+{dashboards_xml}
   </dashboards>
   {windows}
 </workbook>
@@ -792,4 +984,4 @@ with zipfile.ZipFile(TWBX, "w", zipfile.ZIP_DEFLATED) as zf:
     zf.write(HYPER, HYPER_IN_TWBX)
 print(f"theme   : {THEME}")
 print(f"extract : {HYPER} ({n_rows} rows)")
-print(f"workbook: {TWBX} ({len(sheets)} sheets + 2 dashboards)")
+print(f"workbook: {TWBX} ({len(sheets)} sheets + {len(DASHBOARDS)} dashboards)")
