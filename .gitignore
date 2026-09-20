@@ -1,0 +1,3 @@
+# Tableau temporary working copy and Hyper API log
+~*.twbr
+hyperd.log
