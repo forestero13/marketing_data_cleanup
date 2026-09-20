@@ -1,32 +1,5 @@
 #!/usr/bin/env python3
-"""
-build_workbook.py
-
-Builds the Channel Ledger dashboard for Tableau, styled after dashboard_mockup/channel_ledger.html:
-
-    channel_performance.hyper   Tableau extract of cleaned_data/channel_performance.csv
-    marketing_dashboard.twbx    packaged workbook (workbook XML + the extract)
-
-Pages (each is two dashboards, "<page>" and "<page> - Tables", switched by a Charts | Tables toggle):
-    Overview            KPI tiles with sparklines, revenue & spend, ROAS and revenue-by-channel charts
-    Channel efficiency  ROAS by channel, share gap, channel scorecard, channel x quarter ROAS heatmap
-
-Tableau Public only opens extracts, hence the .hyper.
-
-Period and Channel are dashboard parameters, and every measure is written as SUM(IF [In scope] THEN ... END)
-so the whole dashboard follows them (Tableau rejected every worksheet filter written from this script).
-Buttons point at their target dashboard by id, so every sheet, dashboard and window gets a simple-id and the
-file declares the newer format features in document-format-change-manifest.
-
-Known limits: Channel is single-select; "N nulls" badges appear when a period leaves months empty (right-click >
-Hide Indicator); axis labels can't take an "x" suffix; hover dimming and styled tooltips aren't available;
-custom colour ramps written into the file are ignored (the heatmap uses Tableau's built-in Blue); in the editor a
-navigation button needs Alt+click (presentation mode and the web take a normal click).
-
-Requires:  pip install tableauhyperapi pandas
-Run:       python tableau/build_workbook.py [light]      (dark theme by default, as in the mockup)
-Then open marketing_dashboard.twbx in Tableau Desktop or Tableau Public.
-"""
+"""Build the Channel Ledger Tableau workbook (.twbx) and its Hyper extract: python tableau/build_workbook.py [light]."""
 
 import os
 import re

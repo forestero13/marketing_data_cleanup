@@ -1,20 +1,5 @@
 #!/usr/bin/env python3
-"""
-generate_marketing_data.py
-
-Generates three synthetic marketing files for a fictional mid-size e-commerce
-company, covering Jan-2025 through Jun-2026 (18 months):
-
-    crm_orders.csv      ~2,000 order rows      (messy channel names, dupes, nulls)
-    web_sessions.csv    ~5,000 session rows    (different channel names, bad rows)
-    channel_spend.xlsx  ~90 monthly spend rows (third naming set, mixed types, gap)
-
-All three are generated from one underlying ground-truth model, so revenue,
-sessions and spend reconcile once the data is cleaned. The script prints the
-ground truth at the end so a dashboard can be checked against it.
-
-Deterministic: fixed seed, no wall-clock or environment dependence.
-"""
+"""Generate the synthetic crm_orders.csv, web_sessions.csv and channel_spend.xlsx (Jan 2025 - Jun 2026)."""
 
 import calendar
 
@@ -23,21 +8,14 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font
 
-# --------------------------------------------------------------------------
 # Configuration
-# --------------------------------------------------------------------------
 
 SEED = 20250101
 rng = np.random.default_rng(SEED)
 
 MONTHS = pd.period_range("2025-01", "2026-06", freq="M")  # 18 months
 
-# Ground-truth channel economics.
-#   spend  : baseline monthly spend in USD, before seasonality/noise
-#   roas   : baseline revenue / spend (all within the 1.5x - 6.0x band)
-#   aov    : average order value, drives how spend-driven revenue splits into orders
-#   cvr    : session -> order conversion rate, drives session volume
-#   bounce : baseline bounce rate
+# Per-channel ground truth: baseline monthly spend (USD), ROAS, average order value, conversion rate, bounce rate
 CHANNELS = {
     "Google Ads": dict(spend=4500.0, roas=3.00, aov=290.0, cvr=0.021, bounce=0.47),
     "Meta":       dict(spend=2600.0, roas=2.40, aov=240.0, cvr=0.014, bounce=0.58),
@@ -46,12 +24,12 @@ CHANNELS = {
     "Affiliate":  dict(spend=1200.0, roas=1.90, aov=210.0, cvr=0.018, bounce=0.63),
 }
 
-# Mild seasonality: Q4 peak, soft Jan/Feb.
+# mild seasonality: Q4 peak, soft Jan/Feb
 SPEND_SEASONALITY = {
     1: 0.88, 2: 0.85, 3: 0.95, 4: 0.97, 5: 1.00, 6: 1.00,
     7: 0.95, 8: 0.97, 9: 1.05, 10: 1.15, 11: 1.35, 12: 1.30,
 }
-# Efficiency also improves slightly into the holidays.
+# efficiency improves slightly into the holidays
 ROAS_SEASONALITY = {
     1: 0.95, 2: 0.95, 3: 1.00, 4: 1.00, 5: 1.00, 6: 1.00,
     7: 0.98, 8: 1.00, 9: 1.02, 10: 1.05, 11: 1.12, 12: 1.08,
@@ -60,10 +38,10 @@ MONTHLY_GROWTH = 0.004        # ~7% underlying growth across the 18 months
 SPEND_NOISE_SIGMA = 0.08      # lognormal
 ROAS_NOISE_SIGMA = 0.10       # lognormal
 
-# Weekday shape for daily session/order distribution (Mon=0 ... Sun=6)
+# weekday shape for daily sessions and orders (Mon=0 ... Sun=6)
 WEEKDAY_WEIGHTS = {0: 1.06, 1: 1.06, 2: 1.03, 3: 1.00, 4: 0.94, 5: 0.88, 6: 1.03}
 
-# --- Naming variants: three disconnected systems, three different conventions ---
+# Naming variants: each source system spells the channels differently
 
 CRM_VARIANTS = {
     "Google Ads": ["Google Ads", "google_ads", "GoogleAds", "GOOGLE ADS"],
@@ -106,12 +84,10 @@ SPEND_TEXT_SHARE = 0.40       # share of Spend_USD cells written as "$12,450" st
 N_AFFILIATE_GAPS = 2
 
 
-# --------------------------------------------------------------------------
 # Helpers
-# --------------------------------------------------------------------------
 
 def largest_remainder(weights, total):
-    """Allocate an integer total across weights without drift."""
+    """Split an integer total across weights with no rounding drift."""
     w = np.asarray(weights, dtype=float)
     w = w / w.sum() * total
     base = np.floor(w).astype(int)
@@ -121,8 +97,14 @@ def largest_remainder(weights, total):
     return base
 
 
+def banner(title):
+    print("=" * 78)
+    print(title)
+    print("=" * 78)
+
+
 def month_days(period):
-    """List of datetime.date for every day in a pandas Period (month)."""
+    """Every day of a pandas Period (month) as a Timestamp."""
     year, month = period.year, period.month
     n = calendar.monthrange(year, month)[1]
     return [pd.Timestamp(year=year, month=month, day=d) for d in range(1, n + 1)]
@@ -135,10 +117,7 @@ def day_weights(days):
     return base / base.sum()
 
 
-# --------------------------------------------------------------------------
 # 1. Ground-truth monthly model
-# --------------------------------------------------------------------------
-
 rows = []
 for i, m in enumerate(MONTHS):
     growth = 1.0 + MONTHLY_GROWTH * i
@@ -150,35 +129,30 @@ for i, m in enumerate(MONTHS):
 
 truth = pd.DataFrame(rows)
 
-# Orders: revenue / AOV, then forced to hit the exact requested row count.
+# orders = revenue / AOV, forced to the exact row count
 truth["raw_orders"] = truth.apply(
     lambda r: r["model_revenue"] / CHANNELS[r["channel"]]["aov"], axis=1
 )
 truth["orders"] = largest_remainder(truth["raw_orders"].values, N_BASE_ORDERS)
 truth.loc[truth["orders"] < 1, "orders"] = 1
 
-# Sessions: orders / CVR, so conversion rate holds exactly in the cleaned data.
+# sessions = orders / CVR, so conversion holds exactly after cleaning
 truth["sessions"] = truth.apply(
     lambda r: int(round(r["orders"] / CHANNELS[r["channel"]]["cvr"])), axis=1
 )
 
 
-# --------------------------------------------------------------------------
 # 2. crm_orders.csv
-# --------------------------------------------------------------------------
-
 customer_pool = np.array([f"CUST-{i:05d}" for i in range(10000, 10000 + N_CUSTOMERS)])
-# Skewed customer frequency: a minority of customers place most repeat orders.
+# skewed customer frequency: a minority place most repeat orders
 customer_p = rng.lognormal(0.0, 0.7, size=N_CUSTOMERS)
 customer_p /= customer_p.sum()
 
 order_rows = []
 for rec in truth.itertuples():
     n = int(rec.orders)
-    if n == 0:
-        continue
 
-    # Split the month's revenue across its orders, exactly.
+    # split the month's revenue across its orders exactly
     w = rng.lognormal(0.0, 0.55, size=n)
     values = np.round(rec.model_revenue * w / w.sum(), 2)
 
@@ -199,11 +173,10 @@ orders["channel"] = [rng.choice(CRM_VARIANTS[c]) for c in orders["true_channel"]
 orders["region"] = rng.choice(REGIONS, size=len(orders), p=REGION_WEIGHTS)
 orders.loc[rng.random(len(orders)) < REGION_NULL_RATE, "region"] = np.nan
 
-# Ground-truth revenue = the de-duplicated rows only.
+# ground-truth revenue comes from the de-duplicated rows only
 true_revenue = orders.groupby(["month", "true_channel"], as_index=False)["revenue"].sum()
 
-# Duplicated order_ids: same id, slightly different revenue (and sometimes a
-# different casing of the channel or a different region) -- a classic re-export.
+# Duplicated order_ids: same id, slightly different revenue, sometimes a different channel spelling or region
 dupe_idx = rng.choice(len(orders), size=N_DUPLICATE_IDS, replace=False)
 dupes = orders.loc[dupe_idx].copy()
 dupes["revenue"] = np.round(dupes["revenue"] * (1 + rng.uniform(-0.06, 0.06, len(dupes))), 2)
@@ -224,10 +197,7 @@ crm_out = pd.DataFrame({
 crm_out.to_csv("crm_orders.csv", index=False)
 
 
-# --------------------------------------------------------------------------
 # 3. web_sessions.csv
-# --------------------------------------------------------------------------
-
 session_rows = []
 for rec in truth.itertuples():
     days = month_days(rec.month)
@@ -252,7 +222,7 @@ for rec in truth.itertuples():
 web = pd.DataFrame(session_rows, columns=["session_date", "source", "sessions", "bounce_rate"])
 web = web.sample(frac=1.0, random_state=11).reset_index(drop=True)
 
-# Bad extract: a handful of sign-flipped session counts.
+# bad extract: a handful of sign-flipped session counts
 neg_candidates = web.index[web["sessions"] >= 3].to_numpy()
 neg_idx = rng.choice(neg_candidates, size=N_NEGATIVE_SESSION_ROWS, replace=False)
 web.loc[neg_idx, "sessions"] = -web.loc[neg_idx, "sessions"]
@@ -261,11 +231,8 @@ web = web.sort_values("session_date", kind="stable").reset_index(drop=True)
 web.to_csv("web_sessions.csv", index=False)
 
 
-# --------------------------------------------------------------------------
 # 4. channel_spend.xlsx
-# --------------------------------------------------------------------------
-
-# Two months missing for Affiliate, somewhere in the middle of the series.
+# two Affiliate months are omitted from the workbook
 gap_positions = sorted(rng.choice(range(3, len(MONTHS) - 2), size=N_AFFILIATE_GAPS, replace=False))
 affiliate_gaps = {str(MONTHS[i]) for i in gap_positions}
 
@@ -274,8 +241,7 @@ for rec in truth.itertuples():
     if rec.channel == "Affiliate" and str(rec.month) in affiliate_gaps:
         continue
     as_text = rng.random() < SPEND_TEXT_SHARE
-    # Round first, then record that rounded figure as the truth, so the printed
-    # totals reconcile exactly against whatever a dashboard reads back.
+    # round first, then record the rounded figure as the truth, so totals reconcile exactly
     value = round(rec.model_spend) if as_text else round(rec.model_spend, 2)
     spend_records.append(dict(
         month=str(rec.month),
@@ -302,10 +268,7 @@ ws.column_dimensions["C"].width = 14
 wb.save("channel_spend.xlsx")
 
 
-# --------------------------------------------------------------------------
 # 5. Ground-truth summary
-# --------------------------------------------------------------------------
-
 true_spend = spend_df.groupby(["month", "true_channel"], as_index=False)["true_spend"].sum()
 true_sessions = truth[["month", "channel", "sessions", "orders"]].copy()
 true_sessions["month"] = true_sessions["month"].astype(str)
@@ -319,9 +282,7 @@ gt = (true_revenue
 pd.set_option("display.width", 120)
 pd.set_option("display.float_format", lambda v: f"{v:,.2f}")
 
-print("=" * 78)
-print("FILES WRITTEN")
-print("=" * 78)
+banner("FILES WRITTEN")
 print(f"crm_orders.csv       {len(crm_out):>6,} rows  "
       f"({len(orders):,} unique orders + {N_DUPLICATE_IDS} duplicated order_ids)")
 print(f"web_sessions.csv     {len(web):>6,} rows  "
@@ -333,9 +294,7 @@ print(f"nulls in region:     {crm_out['region'].isna().sum():>6,} "
 print(f"spend cells as text: {sum(isinstance(v, str) for v in spend_df['cell']):>6,}")
 
 print()
-print("=" * 78)
-print("GROUND TRUTH BY CHANNEL (Jan-2025 through Jun-2026)")
-print("=" * 78)
+banner("GROUND TRUTH BY CHANNEL (Jan-2025 through Jun-2026)")
 by_channel = gt.groupby("true_channel").agg(
     spend=("true_spend", "sum"),
     revenue=("revenue", "sum"),
@@ -358,9 +317,7 @@ print("NOTE: Affiliate spend excludes the two omitted months, so its ROAS here "
       "reads high on purpose.")
 
 print()
-print("=" * 78)
-print("GROUND TRUTH BY MONTH")
-print("=" * 78)
+banner("GROUND TRUTH BY MONTH")
 by_month = gt.groupby("month").agg(
     spend=("true_spend", "sum"),
     revenue=("revenue", "sum"),
@@ -375,17 +332,13 @@ print(by_month.to_string(formatters={
 }))
 
 print()
-print("=" * 78)
-print("TRUE MONTHLY REVENUE BY CHANNEL")
-print("=" * 78)
+banner("TRUE MONTHLY REVENUE BY CHANNEL")
 print(gt.pivot_table(index="month", columns="true_channel", values="revenue", aggfunc="sum")
         .reindex(columns=list(CHANNELS.keys()))
         .to_string(float_format=lambda v: f"{v:,.0f}"))
 
 print()
-print("=" * 78)
-print("TRUE MONTHLY SPEND BY CHANNEL (blank = omitted from the workbook)")
-print("=" * 78)
+banner("TRUE MONTHLY SPEND BY CHANNEL (blank = omitted from the workbook)")
 print(true_spend.pivot_table(index="month", columns="true_channel", values="true_spend", aggfunc="sum")
         .reindex(columns=list(CHANNELS.keys()))
         .to_string(float_format=lambda v: f"{v:,.0f}", na_rep="--"))
@@ -394,13 +347,11 @@ lost_sessions = int(web.loc[web["sessions"] < 0, "sessions"].abs().sum())
 dupe_delta = float(dupes["revenue"].sum() - orders.loc[dupe_idx, "revenue"].sum())
 
 print()
-print("=" * 78)
-print("CLEANING NOTES")
-print("=" * 78)
+banner("CLEANING NOTES")
 print("To reproduce the numbers above: map the name variants to the five true "
       "channels, drop duplicate order_ids, drop the negative session rows, and "
       "strip '$' and ',' from Spend_USD before casting to float.")
-print(f"- Spend reconciles exactly.")
+print("- Spend reconciles exactly.")
 print(f"- Revenue lands within ~{abs(dupe_delta):,.0f} USD "
       f"({abs(dupe_delta) / by_channel['revenue'].sum():.2%}) of truth depending on "
       f"which copy of each duplicated order_id you keep.")
