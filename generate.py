@@ -2,6 +2,7 @@
 """Generate the synthetic crm_orders.csv, web_sessions.csv and channel_spend.xlsx (Jan 2025 - Jun 2026)."""
 
 import calendar
+import os
 
 import numpy as np
 import pandas as pd
@@ -9,6 +10,9 @@ from openpyxl import Workbook
 from openpyxl.styles import Font
 
 # Configuration
+
+RAW_DIR = "original_data"
+os.makedirs(RAW_DIR, exist_ok=True)
 
 SEED = 20250101
 rng = np.random.default_rng(SEED)
@@ -194,7 +198,7 @@ crm_out = pd.DataFrame({
     "revenue": crm["revenue"].astype(float),
     "region": crm["region"],
 })
-crm_out.to_csv("crm_orders.csv", index=False)
+crm_out.to_csv(os.path.join(RAW_DIR, "crm_orders.csv"), index=False)
 
 
 # 3. web_sessions.csv
@@ -228,7 +232,7 @@ neg_idx = rng.choice(neg_candidates, size=N_NEGATIVE_SESSION_ROWS, replace=False
 web.loc[neg_idx, "sessions"] = -web.loc[neg_idx, "sessions"]
 
 web = web.sort_values("session_date", kind="stable").reset_index(drop=True)
-web.to_csv("web_sessions.csv", index=False)
+web.to_csv(os.path.join(RAW_DIR, "web_sessions.csv"), index=False)
 
 
 # 4. channel_spend.xlsx
@@ -265,7 +269,7 @@ for r in spend_df.itertuples():
 ws.column_dimensions["A"].width = 12
 ws.column_dimensions["B"].width = 26
 ws.column_dimensions["C"].width = 14
-wb.save("channel_spend.xlsx")
+wb.save(os.path.join(RAW_DIR, "channel_spend.xlsx"))
 
 
 # 5. Ground-truth summary
@@ -349,7 +353,7 @@ dupe_delta = float(dupes["revenue"].sum() - orders.loc[dupe_idx, "revenue"].sum(
 print()
 banner("CLEANING NOTES")
 print("To reproduce the numbers above: map the name variants to the five true "
-      "channels, drop duplicate order_ids, drop the negative session rows, and "
+      "channels, drop duplicate order_ids, take abs() of negative session counts, and "
       "strip '$' and ',' from Spend_USD before casting to float.")
 print("- Spend reconciles exactly.")
 print(f"- Revenue lands within ~{abs(dupe_delta):,.0f} USD "
